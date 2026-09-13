@@ -102,6 +102,7 @@ test("chatCompletionStreamInit registers async generator", async () => {
     content: {
       modelId: ["demo"],
       selectedModelId: "demo",
+      streamId: "stream-demo",
       chatOpts: [],
       request: {
         model: "demo",
@@ -113,7 +114,7 @@ test("chatCompletionStreamInit registers async generator", async () => {
   handler.onmessage(message, jest.fn());
   await flushMicrotasks();
   expect(
-    (handler as any).loadedModelIdToAsyncGenerator.get("demo"),
+    (handler as any).streamIdToAsyncGenerator.get("stream-demo"),
   ).toBeDefined();
 });
 
@@ -209,6 +210,7 @@ class MockWorker {
     }));
     this.setResponder("embedding", () => ({ object: "list", data: [] }));
     this.setResponder("reload", () => null);
+    this.setResponder("completionStreamReturn", () => null);
   }
 
   setResponder(kind: string, responder: (msg: any) => any) {
@@ -275,18 +277,71 @@ test("completionStreamNextChunk returns data from stored generator", async () =>
   const generator = (async function* () {
     yield { object: "chunk" };
   })();
-  (handler as any).loadedModelIdToAsyncGenerator.set("demo", generator);
+  (handler as any).streamIdToAsyncGenerator.set("stream-demo", generator);
   const onComplete = jest.fn();
   handler.onmessage(
     {
       kind: "completionStreamNextChunk",
       uuid: "next",
-      content: { selectedModelId: "demo" },
+      content: { streamId: "stream-demo" },
     } as any,
     onComplete,
   );
   await flushMicrotasks();
   expect(onComplete).toHaveBeenCalledWith({ object: "chunk" });
+});
+
+test("completionStreamNextChunk removes a completed generator", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const generator = (async function* () {
+    yield { object: "chunk" };
+  })();
+  (handler as any).streamIdToAsyncGenerator.set("stream-done", generator);
+
+  for (const uuid of ["next-one", "next-done"]) {
+    handler.onmessage(
+      {
+        kind: "completionStreamNextChunk",
+        uuid,
+        content: { streamId: "stream-done" },
+      } as any,
+      jest.fn(),
+    );
+    await flushMicrotasks();
+  }
+
+  expect((handler as any).streamIdToAsyncGenerator.has("stream-done")).toBe(
+    false,
+  );
+});
+
+test("completionStreamReturn closes and removes a stored generator", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  let closed = false;
+  const generator = (async function* () {
+    try {
+      yield { object: "chunk" };
+    } finally {
+      closed = true;
+    }
+  })();
+  await generator.next();
+  (handler as any).streamIdToAsyncGenerator.set("stream-cancel", generator);
+
+  handler.onmessage(
+    {
+      kind: "completionStreamReturn",
+      uuid: "return",
+      content: { streamId: "stream-cancel" },
+    } as any,
+    jest.fn(),
+  );
+  await flushMicrotasks();
+
+  expect(closed).toBe(true);
+  expect((handler as any).streamIdToAsyncGenerator.has("stream-cancel")).toBe(
+    false,
+  );
 });
 
 test("WebWorkerMLCEngine setAppConfig posts configuration message", () => {
@@ -325,4 +380,159 @@ test("WebWorkerMLCEngine info helpers resolve via worker messages", async () => 
   expect(worker.sent.some((msg) => msg.kind === "interruptGenerate")).toBe(
     true,
   );
+});
+
+test.each(["chatCompletion", "completion"] as const)(
+  "WebWorkerMLCEngine gives concurrent %s streams distinct IDs",
+  async (endpoint) => {
+    const worker = new MockWorker();
+    const kind =
+      endpoint === "chatCompletion"
+        ? "chatCompletionStreamInit"
+        : "completionStreamInit";
+    worker.setResponder(kind, () => null);
+    const engine = new WebWorkerMLCEngine(worker as any);
+    engine.modelId = ["demo"];
+    const start = () =>
+      endpoint === "chatCompletion"
+        ? engine.chatCompletion({
+            model: "demo",
+            messages: [{ role: "user", content: "hello" }],
+            stream: true,
+          })
+        : engine.completion({ model: "demo", prompt: "hello", stream: true });
+    const first = (await start()) as AsyncIterableIterator<any>;
+    const second = (await start()) as AsyncIterableIterator<any>;
+    const ids = worker.sent
+      .filter((msg) => msg.kind === kind)
+      .map((msg) => msg.content.streamId);
+    expect(new Set(ids).size).toBe(2);
+    await first.return!();
+    await second.return!();
+    expect(
+      worker.sent
+        .filter((msg) => msg.kind === "completionStreamReturn")
+        .map((msg) => msg.content.streamId),
+    ).toEqual(ids);
+  },
+);
+
+test("WebWorkerMLCEngine return cancels an ordinary stream before first next", async () => {
+  const worker = new MockWorker();
+  worker.setResponder("chatCompletionStreamInit", () => null);
+  const engine = new WebWorkerMLCEngine(worker as any);
+  engine.modelId = ["demo"];
+
+  const stream = (await engine.chatCompletion({
+    model: "demo",
+    messages: [{ role: "user", content: "Cancel" }],
+    stream: true,
+  })) as AsyncIterableIterator<any>;
+  await stream.return!();
+
+  const init = worker.sent.find(
+    (msg) => msg.kind === "chatCompletionStreamInit",
+  );
+  expect(worker.sent).toContainEqual(
+    expect.objectContaining({
+      kind: "completionStreamReturn",
+      content: { streamId: init.content.streamId },
+    }),
+  );
+});
+
+function connectWorkerStream(source: AsyncGenerator<any, void, void>) {
+  const handler = new WebWorkerMLCEngineHandler();
+  const worker = {
+    onmessage: (_event: any) => {
+      void _event;
+    },
+    postMessage: (msg: any) => {
+      setTimeout(() => handler.onmessage(msg), 0);
+    },
+  };
+  handler.postMessage = (msg) => worker.onmessage(msg);
+  (handler as any).streamIdToAsyncGenerator.set("ordered-stream", source);
+  const engine = new WebWorkerMLCEngine(worker);
+  return {
+    iterator: engine.asyncGenerate("ordered-stream"),
+    streams: (handler as any).streamIdToAsyncGenerator as Map<string, unknown>,
+  };
+}
+
+test("worker read-ahead returns done for every read beyond stream exhaustion", async () => {
+  const chunk = { object: "chat.completion.chunk", choices: [] };
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      yield chunk;
+    })(),
+  );
+  await expect(
+    Promise.all([iterator.next(), iterator.next(), iterator.next()]),
+  ).resolves.toEqual([
+    { done: false, value: chunk },
+    { done: true, value: undefined },
+    { done: true, value: undefined },
+  ]);
+  expect(streams.size).toBe(0);
+});
+
+test("worker return waits for a pending read and closes the stream", async () => {
+  let unblock!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  let closes = 0;
+  const chunk = { object: "chat.completion.chunk", choices: [] };
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      try {
+        await gate;
+        yield chunk;
+        yield chunk;
+      } finally {
+        closes++;
+      }
+    })(),
+  );
+  const pending = iterator.next();
+  const returned = iterator.return();
+  await flushMicrotasks();
+  expect(closes).toBe(0);
+  unblock();
+  expect(await pending).toEqual({ done: false, value: chunk });
+  expect(await returned).toEqual({ done: true, value: undefined });
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  expect(closes).toBe(1);
+  expect(streams.size).toBe(0);
+});
+
+test("worker inference failure retires the stream and queued reads return done", async () => {
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      yield { object: "chat.completion.chunk", choices: [] };
+      throw new Error("decode failed");
+    })(),
+  );
+  await iterator.next();
+  const failure = expect(iterator.next()).rejects.toBe("Error: decode failed");
+  const afterFailure = iterator.next();
+  await failure;
+  expect(await afterFailure).toEqual({ done: true, value: undefined });
+  expect(streams.size).toBe(0);
+});
+
+test("worker throw before first read closes the unused stream", async () => {
+  let started = false;
+  const { iterator, streams } = connectWorkerStream(
+    (async function* () {
+      started = true;
+      yield { object: "chat.completion.chunk", choices: [] };
+    })(),
+  );
+  const failure = new Error("consumer stopped");
+  await expect(iterator.throw(failure)).rejects.toBe(failure);
+  expect(await iterator.next()).toEqual({ done: true, value: undefined });
+  expect(started).toBe(false);
+  expect(streams.size).toBe(0);
 });
